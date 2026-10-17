@@ -1,0 +1,32 @@
+# 本地配置，保留公开模板
+.env
+.env.*
+!.env.example
+
+# Python 环境与缓存
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# 编辑器与构建产物
+.idea/
+.vscode/
+build/
+dist/
+*.egg-info/
+
+# 本项目运行产物
+/backend/output/
+/backend/evals/results/
+*.log
+
+# 本地指南，不提交到 GitHub
+/CLI_GUIDE.md
+/EVAL_GUIDE.md

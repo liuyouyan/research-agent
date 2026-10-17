@@ -1,0 +1,558 @@
+"""
+The desktop contract gaps M1 found, closed and pinned (M1.5).
+
+M1's parity harness proved seven paths the desktop build calls and the sidecar did not
+serve. Every one rendered as a working control and answered 404: the Stop button, the whole
+Corpus page (list, status, upload, delete, preview download), and the Settings usage panel.
+
+`test_host_parity.py` asserts the *routes exist*. These assert they **behave** — that the
+canonical per-project corpus path reaches the same flat store the desktop has always had,
+that cancel does what the server's cancel does, and that usage reports real numbers rather
+than a placebo zero.
+
+The design decision worth restating: the per-project path is the canonical product contract
+and both hosts serve it. The desktop's one-`corpus.sqlite`-per-app storage stays exactly as
+it was — it is now an implementation detail behind a shared contract instead of a shape the
+frontend had to know about. No `isDesktop` branch was added to close any of these.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+import httpx
+import pytest
+
+from app.models.session import SessionStatus
+from app.schemas.corpus import CorpusStatusResponse
+from desktop.sidecar import create_sidecar_app
+
+TOKEN = "test-gaps-token"
+
+#: Every corpus assertion here uses a text document. A PDF fixture would exercise the one
+#: narrow *exception* in `download_headers` (inline render, needed by in-place preview);
+#: `txt` exercises the rule itself — an uploaded document must not render in this origin —
+#: which is the half that matters for security.
+TEXT_DOC = (
+    b"Retrieval quality. Recall improved by 12 points on the internal benchmark, and "
+    b"grounded answers beat ungrounded ones on factual questions."
+)
+
+
+@pytest.fixture
+async def sidecar(tmp_path):
+    app = create_sidecar_app(data_dir=tmp_path, token=TOKEN, fake=True)
+    async with app.router.lifespan_context(app):
+        # The corpus store is built during lifespan with the Ollama-backed embedder the
+        # desktop app ships. Nothing is listening in CI, so swap in the deterministic fake
+        # — the same helper `test_desktop_sidecar` uses. The store is what is under test,
+        # not the embedder.
+        from tests.dataflow.test_corpus_store import FakeEmbeddings
+
+        app.state.sidecar["corpus"]._embedder = FakeEmbeddings()  # noqa: SLF001
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:9") as client:
+            yield client
+
+
+def _auth() -> dict:
+    return {"Authorization": f"Bearer {TOKEN}"}
+
+
+async def _project_id(client: httpx.AsyncClient) -> str:
+    resp = await client.get("/api/v1/projects", headers=_auth())
+    assert resp.status_code == 200
+    return resp.json()["projects"][0]["id"]
+
+
+UNKNOWN_PROJECT = "00000000-0000-0000-0000-0000000000ff"
+
+
+# ── Gap 1: cancel ─────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def held_run(monkeypatch):
+    """Hold the pipeline open so a run stays cancellable for the length of a test.
+
+    Cancel is only valid while a session is PENDING or RUNNING. In fake mode the whole
+    pipeline reaches the review gate in about a second, so a test that starts a run and
+    then cancels it is racing the pipeline — measured at roughly one failure in eight.
+    (With real models the window is minutes, so this is a test artefact, not a product
+    limitation.)
+
+    `_drive_session` resolves `run` as a module global at call time, so replacing it here
+    makes the run hang until the test finishes. The route under test is untouched.
+    """
+    import desktop.sidecar as sidecar_module
+
+    async def _never_finishes(**kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(sidecar_module, "run", _never_finishes)
+    return _never_finishes
+
+
+async def test_cancel_stops_a_running_session(sidecar, held_run):
+    start = await sidecar.post(
+        "/api/v1/research",
+        headers=_auth(),
+        json={"query": "What is retrieval-augmented generation?", "depth": "fast"},
+    )
+    assert start.status_code == 202
+    session_id = start.json()["session_id"]
+
+    resp = await sidecar.post(f"/api/v1/research/{session_id}/cancel", headers=_auth())
+    assert resp.status_code == 200
+    assert resp.json()["status"] == SessionStatus.FAILED.value
+
+    detail = await sidecar.get(f"/api/v1/research/{session_id}", headers=_auth())
+    assert detail.json()["error_message"] == "Research stopped by user."
+
+
+async def test_cancel_refuses_a_session_that_is_not_running(sidecar):
+    """Mirrors the server's 400 rather than inventing a different code."""
+    start = await sidecar.post(
+        "/api/v1/research",
+        headers=_auth(),
+        json={"query": "What is retrieval-augmented generation?", "depth": "fast"},
+    )
+    session_id = start.json()["session_id"]
+
+    deadline = asyncio.get_event_loop().time() + 30
+    while asyncio.get_event_loop().time() < deadline:
+        status = (await sidecar.get(f"/api/v1/research/{session_id}", headers=_auth())).json()[
+            "status"
+        ]
+        if status == SessionStatus.AWAITING_APPROVAL.value:
+            break
+        await asyncio.sleep(0.2)
+
+    resp = await sidecar.post(f"/api/v1/research/{session_id}/cancel", headers=_auth())
+    assert resp.status_code == 400
+    assert "AWAITING_APPROVAL" in resp.json()["detail"]
+
+
+async def test_cancel_writes_a_terminal_event_to_the_log(sidecar, held_run):
+    """The monitor is driven by the event stream, so a silent cancel leaves it spinning.
+
+    `_TERMINAL_EVENTS` includes FAILED, so this is what lets an open stream close.
+    """
+    start = await sidecar.post(
+        "/api/v1/research",
+        headers=_auth(),
+        json={"query": "What is retrieval-augmented generation?", "depth": "fast"},
+    )
+    session_id = start.json()["session_id"]
+    cancelled = await sidecar.post(f"/api/v1/research/{session_id}/cancel", headers=_auth())
+    assert cancelled.status_code == 200, cancelled.text
+
+    stream = await sidecar.get(
+        f"/api/v1/research/{session_id}/stream?access_token={TOKEN}",
+        headers={"Accept": "text/event-stream"},
+    )
+    assert stream.status_code == 200
+    assert "FAILED" in stream.text
+
+
+async def test_cancel_event_puts_the_reason_where_the_server_convention_looks(sidecar, held_run):
+    """`session_events.lifecycle_event` moved every other terminal event's failure
+    reason from `message` to `data.reason` (parity Phase 2c) — `cancel_session` built
+    its own event by hand on both hosts and never picked that convention up. The
+    desktop's copy put it in `message`, so a client reading `data.reason` for a
+    user-stopped session saw nothing, while the exact same client reading it for a
+    provider-error failure saw the reason correctly. Delegating this route (plan
+    phase 7's last session route) fixed it by construction: there is now one place
+    that builds this event, not two that happened to agree until this test existed.
+    """
+    start = await sidecar.post(
+        "/api/v1/research",
+        headers=_auth(),
+        json={"query": "What is retrieval-augmented generation?", "depth": "fast"},
+    )
+    session_id = start.json()["session_id"]
+    cancelled = await sidecar.post(f"/api/v1/research/{session_id}/cancel", headers=_auth())
+    assert cancelled.status_code == 200, cancelled.text
+
+    stream = await sidecar.get(
+        f"/api/v1/research/{session_id}/stream?access_token={TOKEN}",
+        headers={"Accept": "text/event-stream"},
+    )
+    failed_line = next(line for line in stream.text.splitlines() if '"type": "FAILED"' in line)
+    payload = json.loads(failed_line.split("data: ", 1)[1])
+    assert payload["data"]["reason"] == "Research stopped by user.", (
+        f"the reason travelled somewhere else: {payload}"
+    )
+
+
+async def test_cancel_404s_for_an_unknown_session(sidecar):
+    resp = await sidecar.post(
+        "/api/v1/research/00000000-0000-0000-0000-000000000000/cancel", headers=_auth()
+    )
+    assert resp.status_code == 404
+
+
+# ── Gaps 2–5 + download: the canonical per-project corpus contract ────────────────
+
+
+async def test_per_project_corpus_paths_reach_the_flat_store(sidecar):
+    """The whole point of the alias: one client contract, the desktop's own storage.
+
+    Uploading through the canonical per-project path must be visible through the flat
+    route the desktop has always served, because they are the same corpus.
+    """
+    pid = await _project_id(sidecar)
+
+    upload = await sidecar.post(
+        f"/api/v1/projects/{pid}/corpus/documents",
+        headers=_auth(),
+        files={"file": ("notes.txt", TEXT_DOC, "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+    doc_id = upload.json()["id"]
+
+    via_project = await sidecar.get(f"/api/v1/projects/{pid}/corpus/documents", headers=_auth())
+    via_flat = await sidecar.get("/api/v1/corpus/documents", headers=_auth())
+    assert via_project.status_code == 200
+    assert via_project.json() == via_flat.json()
+    assert any(d["id"] == doc_id for d in via_project.json())
+
+
+async def test_per_project_corpus_status_matches_the_flat_one(sidecar):
+    pid = await _project_id(sidecar)
+    await sidecar.post(
+        f"/api/v1/projects/{pid}/corpus/documents",
+        headers=_auth(),
+        files={"file": ("notes.txt", TEXT_DOC, "text/plain")},
+    )
+
+    via_project = await sidecar.get(f"/api/v1/projects/{pid}/corpus/status", headers=_auth())
+    via_flat = await sidecar.get("/api/v1/corpus/status", headers=_auth())
+    assert via_project.status_code == 200
+
+    # Against the SERVER's shape, not against the other desktop route. Asserting the two
+    # desktop responses are equal only proves they are consistent with each other, which
+    # is what AGENTS.md means by "compare two implementations against themselves and call
+    # that parity" — and it is how the `{"documents": [...]}` wrapper survived review.
+    assert set(via_project.json()) == set(CorpusStatusResponse.model_fields)
+    assert via_project.json()["documents"] == 1
+    assert via_project.json()["chunks"] >= 1
+
+    # The flat route is desktop-only in its *path* — one `corpus.sqlite` for the whole app
+    # rather than one file per project — and identical in its body. It used to carry an
+    # extra `corpus_only` field for a persistent airgap switch that nothing in `frontend/`
+    # could set or read, and that was the only input to `RunConfig.corpus_mode` on this
+    # host, so the `corpus_mode` a run requested was stored and never read. The switch is
+    # gone and the desktop takes corpus mode per run, exactly as the server does.
+    assert set(via_flat.json()) == set(CorpusStatusResponse.model_fields)
+    assert via_flat.json() == via_project.json()
+
+
+async def test_upload_accepts_the_multipart_body_the_browser_sends(sidecar):
+    """The encoding half of the gap, which the path fix alone would not have closed.
+
+    The sidecar's flat route takes raw bytes with the name in the query string. The
+    frontend sends a `FormData`. Matching the server's `UploadFile` signature is what
+    makes one client code path work against both hosts.
+    """
+    pid = await _project_id(sidecar)
+    resp = await sidecar.post(
+        f"/api/v1/projects/{pid}/corpus/documents",
+        headers=_auth(),
+        files={"file": ("notes.txt", TEXT_DOC, "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["filename"] == "notes.txt"
+
+
+async def test_upload_rejects_an_empty_document(sidecar):
+    pid = await _project_id(sidecar)
+    resp = await sidecar.post(
+        f"/api/v1/projects/{pid}/corpus/documents",
+        headers=_auth(),
+        files={"file": ("empty.txt", b"", "text/plain")},
+    )
+    # 400, matching the server: the status codes for a refused upload are one contract now
+    # (app/services/corpus_ingest.py). This asserted 422 while the server asserted 400 for
+    # the same rejection, which is the divergence Phase 2b closed.
+    assert resp.status_code == 400
+
+
+async def test_delete_through_the_canonical_path_removes_the_document(sidecar):
+    pid = await _project_id(sidecar)
+    upload = await sidecar.post(
+        f"/api/v1/projects/{pid}/corpus/documents",
+        headers=_auth(),
+        files={"file": ("notes.txt", TEXT_DOC, "text/plain")},
+    )
+    doc_id = upload.json()["id"]
+
+    delete = await sidecar.delete(
+        f"/api/v1/projects/{pid}/corpus/documents/{doc_id}", headers=_auth()
+    )
+    assert delete.status_code == 204
+
+    listed = await sidecar.get("/api/v1/corpus/documents", headers=_auth())
+    assert not any(d["id"] == doc_id for d in listed.json())
+
+
+async def test_delete_404s_for_an_unknown_document(sidecar):
+    pid = await _project_id(sidecar)
+    resp = await sidecar.delete(
+        f"/api/v1/projects/{pid}/corpus/documents/does-not-exist", headers=_auth()
+    )
+    assert resp.status_code == 404
+
+
+async def test_download_returns_the_original_bytes(sidecar):
+    """The seventh gap — the one M1 misfiled as an intentional difference.
+
+    `documentUrl()` builds this path for the Corpus page and the report preview drawer, so
+    every citation preview on desktop was a 404.
+    """
+    pid = await _project_id(sidecar)
+    upload = await sidecar.post(
+        f"/api/v1/projects/{pid}/corpus/documents",
+        headers=_auth(),
+        files={"file": ("notes.txt", TEXT_DOC, "text/plain")},
+    )
+    doc_id = upload.json()["id"]
+
+    resp = await sidecar.get(
+        f"/api/v1/projects/{pid}/corpus/documents/{doc_id}/download", headers=_auth()
+    )
+    assert resp.status_code == 200
+    assert resp.content == TEXT_DOC
+
+
+async def test_download_carries_the_servers_own_no_render_headers(sidecar):
+    """`download_headers` is imported from the server, not restated.
+
+    An uploaded document must not render in this origin; PDF is the one narrow exception
+    that in-place preview needs. Duplicating that policy per host is how one copy ends up
+    permissive.
+    """
+    from app.api.v1.corpus import download_headers
+
+    pid = await _project_id(sidecar)
+    upload = await sidecar.post(
+        f"/api/v1/projects/{pid}/corpus/documents",
+        headers=_auth(),
+        files={"file": ("notes.txt", TEXT_DOC, "text/plain")},
+    )
+    doc_id = upload.json()["id"]
+
+    resp = await sidecar.get(
+        f"/api/v1/projects/{pid}/corpus/documents/{doc_id}/download", headers=_auth()
+    )
+    expected = download_headers("txt", "notes.txt")
+    for header, value in expected.items():
+        assert resp.headers.get(header) == value, f"{header} diverged from the server's policy"
+
+
+async def test_download_404s_for_an_unknown_document(sidecar):
+    pid = await _project_id(sidecar)
+    resp = await sidecar.get(
+        f"/api/v1/projects/{pid}/corpus/documents/nope/download", headers=_auth()
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("GET", "/corpus/documents"),
+        ("GET", "/corpus/status"),
+        ("POST", "/corpus/documents"),
+    ],
+)
+async def test_corpus_aliases_404_on_a_project_that_is_not_yours(sidecar, method, path):
+    """`_resolve_project` still runs, so the authorization boundary is unchanged.
+
+    The project id does not select a store here — there is only one — but answering for a
+    project that does not exist would be a different contract from the server's, and a
+    client cannot tell the difference between "no such project" and "empty corpus" if the
+    alias shrugs.
+    """
+    resp = await sidecar.request(
+        method,
+        f"/api/v1/projects/{UNKNOWN_PROJECT}{path.replace('/corpus', '/corpus')}".replace(
+            "/api/v1/projects/", "/api/v1/projects/"
+        ),
+        headers=_auth(),
+        files={"file": ("x.txt", b"x", "text/plain")} if method == "POST" else None,
+    )
+    assert resp.status_code == 404
+
+
+# ── Gap 6: usage ──────────────────────────────────────────────────────────────────
+
+
+async def test_usage_reports_real_numbers_not_a_placebo(sidecar):
+    """Served rather than hidden: the usage half is meaningful for a BYOK local user.
+
+    The *limit* half is not — a single local user paying their own provider bill has no
+    monthly ceiling — and the response says so honestly rather than inventing one.
+    """
+    resp = await sidecar.get("/api/v1/auth/me/usage", headers=_auth())
+    assert resp.status_code == 200
+    body = resp.json()
+
+    for window in ("month", "week", "last_session"):
+        assert window in body, f"{window} missing from the usage response"
+
+    assert body["monthly_token_limit"] == 0, "no ceiling applies to one local user"
+    assert body["limit_remaining"] is None, "unlimited must be null, not a number"
+    assert body["limit_reached"] is False
+
+
+async def test_usage_counts_a_completed_run(sidecar):
+    """Not a hardcoded zero: a run that spent tokens has to show up.
+
+    Fake mode still reports token counts, which is what makes this checkable without a
+    provider — and what makes a regression to `return 0` visible.
+    """
+    before = (await sidecar.get("/api/v1/auth/me/usage", headers=_auth())).json()
+
+    start = await sidecar.post(
+        "/api/v1/research",
+        headers=_auth(),
+        json={"query": "What is retrieval-augmented generation?", "depth": "fast"},
+    )
+    session_id = start.json()["session_id"]
+    deadline = asyncio.get_event_loop().time() + 30
+    while asyncio.get_event_loop().time() < deadline:
+        status = (await sidecar.get(f"/api/v1/research/{session_id}", headers=_auth())).json()[
+            "status"
+        ]
+        if status == SessionStatus.AWAITING_APPROVAL.value:
+            break
+        await asyncio.sleep(0.2)
+    await sidecar.post(
+        f"/api/v1/research/{session_id}/approve", headers=_auth(), json={"approved": True}
+    )
+    while asyncio.get_event_loop().time() < deadline:
+        status = (await sidecar.get(f"/api/v1/research/{session_id}", headers=_auth())).json()[
+            "status"
+        ]
+        if status == SessionStatus.COMPLETED.value:
+            break
+        await asyncio.sleep(0.2)
+
+    after = (await sidecar.get("/api/v1/auth/me/usage", headers=_auth())).json()
+    assert after["month"]["tokens_total"] >= before["month"]["tokens_total"]
+    assert after["last_session"]["tokens_total"] > 0, "a completed run reported no tokens at all"
+
+
+async def test_a_duplicate_project_name_is_a_conflict_on_the_desktop_too(sidecar):
+    """The ProjectSwitcher's most ordinary error path must not be a 500.
+
+    `POST /projects` is a shipped desktop control (`DESKTOP_UI_CALLS`), and retyping a name
+    you already used is not an edge case. The server catches `IntegrityError` and answers
+    409 with the offending name; the desktop let it escape as an unhandled 500. Found by
+    running the PyInstaller-packaged sidecar rather than the source app — the divergence is
+    in behaviour, so route-level parity was satisfied throughout.
+    """
+    first = await sidecar.post("/api/v1/projects", json={"name": "Duplicate Name"}, headers=_auth())
+    assert first.status_code == 201
+
+    again = await sidecar.post("/api/v1/projects", json={"name": "Duplicate Name"}, headers=_auth())
+    assert again.status_code == 409, f"expected a conflict, got {again.status_code}"
+    assert "Duplicate Name" in again.json()["detail"]
+
+
+# ── Readiness ─────────────────────────────────────────────────────────────────────
+#
+# `get_readiness` computes its answer from a live probe of the configured Ollama, and
+# nothing in the suite pins `OLLAMA_BASE_URL`. Left alone, these assertions describe the
+# machine rather than the code: they hold on a box with no Ollama and invert on one that
+# has a chat model pulled. Each test below stubs the transport — never `local_llm.probe`
+# itself, the convention `tests/task/test_local_llm.py` and `test_desktop_sidecar.py`
+# already state — so the probe's own parsing stays under test while its network does not.
+
+
+def _mock_probe_transport(handler):
+    """An `httpx.AsyncClient` that answers from `handler` instead of the network.
+
+    Built from the real class at call time, so it must be constructed *before* the
+    `monkeypatch.setattr` that installs it.
+    """
+
+    class _Client(httpx.AsyncClient):
+        def __init__(self, *a, **kw):
+            kw["transport"] = httpx.MockTransport(handler)
+            super().__init__(*a, **kw)
+
+    return _Client
+
+
+def _ollama_serving(*tags: str):
+    """A handler answering Ollama's `/api/tags` with exactly these model tags."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"models": [{"name": t, "size": 1} for t in tags]})
+
+    return handler
+
+
+def _ollama_down(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("connection refused", request=request)
+
+
+async def test_readiness_is_not_a_shipped_control_that_404s(sidecar, monkeypatch):
+    """`useReadiness()` (frontend/hooks/queries.ts) fetches `/models/readiness`
+    unconditionally on every host — `SettingsLayout` only gates how the *result* is used
+    behind `!isDesktop`, not the fetch itself. The sidecar had no route for it at all, so
+    every desktop settings-page render fired a real request and got a 404 back: a
+    shipped control that never worked, the exact class `AGENTS.md` names repeatedly.
+    Found by driving the real sidecar the way the browser does, not by reading the route
+    table — `test_host_parity` would have called this `INTENTIONAL_DESKTOP_ONLY` (a
+    justified difference), when it is actually `KNOWN_DESKTOP_GAPS` territory (a control
+    that ships broken) — the two answer different questions.
+    """
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_probe_transport(_ollama_down))
+
+    resp = await sidecar.get("/api/v1/models/readiness", headers=_auth())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"ready", "has_cloud_key", "local_reachable", "local_chat_models"}
+    # `fake=True` carries no provider key at all (research_engine.runconfig.RunConfig's
+    # default `provider_keys` is `{}` on the fake branch) and no local server answers —
+    # so an honest desktop with no key configured reads as not ready, the same as the
+    # server would report for a keyless deployment. Readiness measures real providers,
+    # not whether the scripted/fake path would run; conflating them is the "demo rule"
+    # AGENTS.md is explicit about.
+    assert body["has_cloud_key"] is False
+    assert body["local_reachable"] is False
+    assert body["ready"] is False
+
+
+async def test_readiness_is_true_on_a_reachable_server_with_a_chat_model(sidecar, monkeypatch):
+    """The other half of the verdict, and the one the unpinned probe used to decide by
+    accident: a desktop with no key is still ready when a local chat model can fill an
+    agent role.
+    """
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_probe_transport(_ollama_serving("qwen2.5:14b")))
+
+    body = (await sidecar.get("/api/v1/models/readiness", headers=_auth())).json()
+    assert body["has_cloud_key"] is False
+    assert body["local_reachable"] is True
+    assert body["local_chat_models"] == 1
+    assert body["ready"] is True
+
+
+async def test_an_embedding_only_server_is_reachable_but_not_ready(sidecar, monkeypatch):
+    """Reachability is not readiness. An embedding model cannot fill an agent role, so a
+    server offering nothing else leaves the user unable to run research — which is why
+    the route counts chat models instead of trusting `reachable`. Pinning it here stops a
+    future "simplification" to `ready=local_reachable` from passing.
+    """
+    monkeypatch.setattr(
+        httpx, "AsyncClient", _mock_probe_transport(_ollama_serving("nomic-embed-text:latest"))
+    )
+
+    body = (await sidecar.get("/api/v1/models/readiness", headers=_auth())).json()
+    assert body["local_reachable"] is True
+    assert body["local_chat_models"] == 0
+    assert body["ready"] is False
